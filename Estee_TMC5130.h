@@ -2,6 +2,7 @@
 MIT License
 
 Copyright (c) 2016 Mike Estee
+Copyright (c) 2017 Tom Magnier
 
 Permission is hereby granted, free of charge, to any person obtaining a copy
 of this software and associated documentation files (the "Software"), to deal
@@ -27,209 +28,268 @@ SOFTWARE.
 
 #include <Arduino.h>
 #include <SPI.h>
-
+#include <Estee_TMC5130_registers.h>
 
 class Estee_TMC5130 {
-	uint8_t _CS;
-	uint32_t _fclk;
-	SPISettings _spiSettings;
-	SPIClass &_spi;
 public:
-	Estee_TMC5130( uint8_t chipSelectPin,	// pin to use for the SPI bus SS line
-		uint32_t fclk=F_CPU,
-		const SPISettings &spiSettings=SPISettings(1000000, MSBFIRST, SPI_MODE0), // spi bus settings to use
-		SPIClass& spi=SPI ); // spi class to use
+	static constexpr uint8_t IC_VERSION = 0x11;
+
+	enum MotorDirection { NORMAL_MOTOR_DIRECTION =	0x00, INVERSE_MOTOR_DIRECTION = 0x1 };
+	enum RampMode { POSITIONING_MODE, VELOCITY_MODE, HOLD_MODE };
+
+	Estee_TMC5130(uint32_t fclk = DEFAULT_F_CLK);
 	~Estee_TMC5130();
 
 	// start/stop this module
-	bool begin(uint8_t ihold, uint8_t irun, uint8_t stepper_direction/*=NORMAL_MOTOR_DIRECTION*/);
+	bool begin(uint8_t ihold, uint8_t irun, MotorDirection stepper_direction/*=NORMAL_MOTOR_DIRECTION*/);
 	void end();
 
-	uint32_t readRegister(uint8_t address);	// addresses are from TMC5130.h
-	uint8_t  writeRegister(uint8_t address, uint32_t data);
-	uint8_t  readStatus();
+	virtual uint32_t readRegister(uint8_t address) = 0;	// addresses are from TMC5130.h
+	virtual uint8_t  writeRegister(uint8_t address, uint32_t data) = 0;
+
+	/* Check if the last register read was successful. This should be checked whenever
+	 a register read is used to take a decision.
+	 Reasons for failure can be : data bus disconnected, transmission error (bad CRC), etc
+	 This is mostly useful in UART mode.
+	 */
+	bool isLastReadSuccessful();
 
 	// internal clock measuring
 	// NOTE: Driver MUST BE DISABLED DURING THIS CALL
 	float updateFrequencyScaling();
 
-	// high level interface
-	void setRampCurves() {}
+	/* Ramp mode selection :
+		- Positioning mode : autonomous move to XTARGET using all A, D and V parameters.
+		- Velocity mode : follows VMAX and AMAX. Call setMaxSpeed() AFTER switching to velocity mode.
+		- Hold mode : Keep current velocity until a stop event occurs.
+	*/
+	void setRampMode(RampMode mode);
+
+	long getCurrentPosition(); // Return the current internal position (steps)
+	long getEncoderPosition(); // Return the current position according to the encoder counter (steps)
+	long getLatchedPosition(); // Return the position that was latched on the last ref switch / encoder event (steps)
+	long getLatchedEncoderPosition(); // Return the encoder position that was latched on the last encoder event (steps)
+	long getTargetPosition(); // Get the target position (steps)
+	float getCurrentSpeed(); // Return the current speed (steps / second)
+
+
+	void setCurrentPosition(long position, bool updateEncoderPos = false); // Set the current internal position (steps) and optionally update the encoder counter as well to keep them in sync.
+	void setTargetPosition(long position); // Set the target position /!\ Set all other motion profile parameters before
+	void setMaxSpeed(float speed); // Set the max speed VMAX (steps/second)
+	void setRampSpeeds(float startSpeed, float stopSpeed, float transitionSpeed); // Set the ramp start speed VSTART, ramp stop speed VSTOP, acceleration transition speed V1 (steps / second). /!\ Set VSTOP >= VSTART, VSTOP >= 0.1
+	void setAcceleration(float maxAccel); // Set the ramp acceleration / deceleration (steps / second^2)
+	void setAccelerations(float maxAccel, float maxDecel, float startAccel, float finalDecel); // Set the ramp accelerations AMAX, DMAX, A1, D1 (steps / second^2) /!\ Do not set startAccel, finalDecel to 0 even if transitionSpeed = 0
+
+	void stop(); // Stop the current motion according to the set ramp mode and motion parameters. The max speed and start speed are set to 0 but the target position stays unchanged.
+
+	//TODO chopper config functions ?
+	//TODO driver status functions
+
+	/* Set the speeds (in steps/second) at which the internal functions and modes will be turned on or off.
+	 * Below pwmThrs, "stealthChop" PWM mode is used.
+	 * Between pwmThrs and highThrs, "spreadCycle" classic mode is used.
+	 * Between coolThrs and highThrs, "spreadCycle" is used ; "coolStep" current reduction and "stallGuard" load measurement can be enabled.
+	 * Above highThrs, "constant Toff" mode and fullstep mode can be enabled.
+	 * See the TMC 5130 datasheet for details and optimization.
+	 * Setting a speed to 0 will disable this threshold.
+	 */
+	void setModeChangeSpeeds(float pwmThrs, float coolThrs, float highThrs);
+
+	/* Set the encoder constant to match the motor and encoder resolutions.
+	 * This function will determine if the binary or decimal mode should be used
+	 * and return false if no exact match could be found (for example for an encoder
+	 * with a resolution of 360 and a motor with 200 steps per turn). In this case
+	 * the best approximation in decimal mode will be used.
+	 *
+	 * Params :
+	 * 		motorSteps : the number of steps per turn for the motor
+	 * 		encResolution : the actual encoder resolution (pulses per turn)
+	 * 		inverted : whether the encoder and motor rotations are inverted
+	 *
+	 * Return :
+	 * 		true if an exact match was found, false otherwise
+	 */
+	bool setEncoderResolution(int motorSteps, int encResolution, bool inverted = false);
+
+	/* Configure the encoder N event context.
+	 * Params :
+	 * 		sensitivity : set to one of ENCODER_N_NO_EDGE, ENCODER_N_RISING_EDGE, ENCODER_N_FALLING_EDGE, ENCODER_N_BOTH_EDGES
+	 * 		nActiveHigh : choose N signal polarity (true for active high)
+	 * 		ignorePol : if true, ignore A and B polarities to validate a N event
+	 * 		aActiveHigh : choose A signal polarity (true for active high) to validate a N event
+	 * 		bActiveHigh : choose B signal polarity (true for active high) to validate a N event
+	 */
+	void setEncoderIndexConfiguration(TMC5130_Reg::ENCMODE_sensitivity_Values sensitivity, bool nActiveHigh = true, bool ignorePol = true, bool aActiveHigh = false, bool bActiveHigh = false);
+
+	/* Enable/disable encoder and position latching on each encoder N event (on each revolution)
+	 * The difference between the 2 positions can then be compared regularly to check
+	 * for an external step loss.
+	 */
+	void setEncoderLatching(bool enabled);
+
+	//TODO end stops and stallguard config functions ?
+
+protected:
+	static constexpr uint8_t WRITE_ACCESS = 0x80;	//Register write access for spi / uart communication
+	static constexpr uint32_t DEFAULT_F_CLK = 13200000; // Typical internal clock frequency in Hz.
+
+	bool _lastRegisterReadSuccess = false;
 
 private:
+	uint32_t _fclk;
+	RampMode _currentRampMode;
+	static constexpr uint16_t _uStepCount = 256; // Number of microsteps per step
+
+	// Following §14.1 Real world unit conversions
+	// v[Hz] = v[5130A] * ( f CLK [Hz]/2 / 2^23 )
+	float speedToHz(long speedInternal) { return ((float)speedInternal * (float)_fclk / (float)(1ul << 24) / (float)_uStepCount); }
+	long speedFromHz(float speedHz) { return (long)(speedHz / ((float)_fclk / (float)(1ul << 24)) * (float)_uStepCount); }
+
+	// Following §14.1 Real world unit conversions
+	// a[Hz/s] = a[5130A] * f CLK [Hz]^2 / (512*256) / 2^24
+	long accelFromHz(float accelHz) { return (long)(accelHz / ((float)_fclk * (float)_fclk / (512.0*256.0) / (float)(1ul << 24)) * (float)_uStepCount); }
+
+	// See §12 Velocity based mode control
+	long thrsSpeedToTstep(float thrsSpeed) { return thrsSpeed != 0.0 ? (long)constrain((float)_fclk / (thrsSpeed * 256.0), 0, 1048575) : 0; }
+};
+
+
+/* SPI interface : 
+ * the TMC5130 SWSEL input has to be low (default state).
+ */
+class Estee_TMC5130_SPI : public Estee_TMC5130 {
+public:
+	Estee_TMC5130_SPI( uint8_t chipSelectPin,	// pin to use for the SPI bus SS line
+		uint32_t fclk = DEFAULT_F_CLK,
+		const SPISettings &spiSettings = SPISettings(1000000, MSBFIRST, SPI_MODE0), // spi bus settings to use
+		SPIClass& spi = SPI ); // spi class to use
+
+	uint32_t readRegister(uint8_t address);	// addresses are from TMC5130.h
+	uint8_t  writeRegister(uint8_t address, uint32_t data);
+	uint8_t  readStatus();
+
+private:
+	uint8_t _CS;
+	SPISettings _spiSettings;
+	SPIClass *_spi;
+
 	void _beginTransaction();
 	void _endTransaction();
 };
 
 
-// TRINAMIC TMC5130 Register Address Defines
-#define GCONF				0x00 	//Global configuration flags
-#define X_COMPARE 			0x05	//Position  comparison  register
-#define IHOLD_IRUN			0x10	//Driver current control
-#define TCOOLTHRS			0x14	//This is the lower threshold velocity for switching on smart energy coolStep and stallGuard feature.
-#define RAMPMODE			0x20	//Driving mode (Velocity, Positioning, Hold)
+/* Base UART interface :
+ * the TMC5130 SWSEL input must be tied high.
+ *
+ * This class does not handle TX/RX switch on the half-duplex bus.
+ * It should be used only if there is another mechanism to switch between
+ * transmission and reception (e.g. on Teensy the Serial class can be configured
+ * to control an external transceiver).
+ *
+ * Serial must be initialized externally. Serial.setTimeout() must be set to a
+ * decent value to avoid blocking for too long if there is a RX error.
+ */
+class Estee_TMC5130_UART : public Estee_TMC5130 {
+public:
+	/* Read/write register return codes */
+	enum ReadStatus {SUCCESS, NO_REPLY, INVALID_FORMAT, BAD_CRC};
 
-// q & qdot (position, velocity)
-#define XACTUAL				0x21	//Actual motor position
-#define VACTUAL 			0x22	//Actual  motor  velocity  from  ramp  generator
-
-// Ramp curves
-#define VSTART				0x23	//Motor start velocity
-#define A_1					0x24	//First  acceleration  between  VSTART  and  V1
-#define V_1					0x25	//First  acceleration  /  deceleration  phase  target velocity
-#define AMAX				0x26	//Second  acceleration  between  V1  and  VMAX
-#define VMAX 				0x27	//This is the target velocity in velocity mode. It can be changed any time during a motion.
-#define DMAX				0x28	//Deceleration between VMAX and V1
-#define D_1					0x2A 	//Deceleration  between  V1  and  VSTOP
-									//Attention:  Do  not  set  0  in  positioning  mode, even if V1=0!
-#define VSTOP				0x2B	//Motor stop velocity (unsigned)
-									//Attention: Set VSTOP > VSTART!
-									//Attention:  Do  not  set  0  in  positioning  mode, minimum 10 recommend!
-#define TZEROWAIT			0x2C	//Defines  the  waiting  time  after  ramping  down
-									//to  zero  velocity  before  next  movement  or
-									//direction  inversion  can  start.  Time  range  is about 0 to 2 seconds.
-
-#define XTARGET				0x2D	//Target position for ramp mode
-#define SW_MODE 			0x34	//Switch mode configuration
-#define RAMP_STAT			0x35	//Ramp status and switch event status
-#define XLATCH				0x36	//Latches  XACTUAL  upon  a programmable switch event
+	/* Serial communication modes. In reliable mode, register writes are checked and
+	 * retried if necessary, and register reads are retried multiple times in case
+	 * of failure. In streaming mode, none of these checks are performed and register
+	 * read / writes are tried only once. Default is Streaming mode. */
+	enum CommunicationMode {RELIABLE_MODE, STREAMING_MODE};
 
 
-#define CHOPCONF			0x6C	//Chopper and driver configuration
-#define 	DISS2G(n)		(((n)&0x1)<<30)	// Short to GND protection is on=1,disabled=0
-#define 	DEDGE(n)		(((n)&0x1)<<29) // 1: Enable step impulse at each step edge to reduce step frequency requirement
-#define 	INTPOL(n)		(((n)&0x1)<<28) // 1: The actual microstep resolution (MRES) becomes extrapolated to
-											// 256 microsteps for smoothest motor operation (useful for Step/Dir operation, only)
-#define 	MRES(n)			(((n)&0xF)<<24) // %0000: Native 256 microstep setting. Normally use this setting
-											// with the internal motion controller.
-											// %0001 … %1000:
-											// 128, 64, 32, 16, 8, 4, 2, FULLSTEP
-											// Reduced microstep resolution esp. for Step/Dir operation.
-											// The resolution gives the number of microstep entries per
-											// sine quarter wave.
-											// The driver automatically uses microstep positions which
-											// result in a symmetrical wave, when choosing a lower
-											// microstep resolution.
-											// step width=2^MRES [microsteps]
-#define 	SYNC(n)			(((n)&0xF)<<20) // This register allows synchronization of the chopper for
-											// both phases of a two phase motor in order to avoid the
-											// occurrence of a beat, especially at low motor velocities. It
-											// is automatically switched off above VHIGH.
-											// %0000: Chopper sync function chopSync off
-											// %0001 … %1111:
-											// Synchronization with fSYNC = fCLK/(sync*64)
-											// Hint: Set TOFF to a low value, so that the chopper cycle is
-											// ended, before the next sync clock pulse occurs. Set for the
-											// double desired chopper frequency for chm=0, for the
-											// desired base chopper frequency for chm=1
-#define 	VHIGHCHM(n)		(((n)&0x1)<<19) // This bit enables switching to chm=1 and fd=0, when VHIGH
-											// is exceeded. This way, a higher velocity can be achieved.
-											// Can be combined with vhighfs=1. If set, the TOFF setting
-											// automatically becomes doubled during high velocity
-											// operation in order to avoid doubling of the chopper
-											// frequency.
-#define 	VHIGHFS(n)		(((n)&0x1)<<18) // This bit enables switching to fullstep, when VHIGH is
-											// exceeded. Switching takes place only at 45° position.
-											// The fullstep target current uses the current value from
-											// the microstep table at the 45° position.
-#define 	VSENSE(n)		(((n)&0x1)<<17) //0: Low sensitivity, high sense resistor voltage
-											//1: High sensitivity, low sense resistor voltage
-#define 	TBL(n)			(((n)&0x3)<<15) // %00 … %11:
-											// Set comparator blank time to 16, 24, 36 or 54 clocks
-											// Hint: %01 or %10 is recommended for most applications
-#define 	CHM(n)			(((n)&0x1)<<14) // 0 Standard mode (spreadCycle)
-											// 1 Constant off time with fast decay time.
-											// Fast decay time is also terminated when the
-											// negative nominal current is reached. Fast decay is
-											// after on time.
-#define 	RNDTF(n)		(((n)&0x1)<<13) // 0 Chopper off time is fixed as set by TOFF
-											// 1 Random mode, TOFF is random modulated by
-											// dNCLK= -12 … +3 clocks.
-#define 	DISFDCC(n)		(((n)&0x1)<<12) // chm=1:
-											// disfdcc=1 disables current comparator usage for termination
-											// of the fast decay cycle
-#define 	TFD3(n)			(((n)&0x1)<<11) // chm=1: MSB of fast decay time setting TFD[3]
-#define 	HEND(n)			(((n)&0xF)<<7)  // chm=0 %0000 … %1111:
-											// Hysteresis is -3, -2, -1, 0, 1, …, 12
-											// (1/512 of this setting adds to current setting)
-											// This is the hysteresis value which becomes
-											// used for the hysteresis chopper.
-											// chm=1 %0000 … %1111:
-											// Offset is -3, -2, -1, 0, 1, …, 12
-											// This is the sine wave offset and 1/512 of the
-											// value becomes added to the absolute value
-											// of each sine wave entry.
-#define 	HSTRT_TFD(n)	(((n)&0x7)<<4)  // chm=0 %000 … %111:
-											// Add 1, 2, …, 8 to hysteresis low value HEND
-											// (1/512 of this setting adds to current setting)
-											// Attention: Effective HEND+HSTRT ≤ 16.
-											// Hint: Hysteresis decrement is done each 16
-											// clocks
+	Estee_TMC5130_UART(Stream& serial = Serial, // Serial port to use
+		uint8_t slaveAddress = 0, // TMC5130 slave address (default 0 if NAI is low, 1 if NAI is high)
+		uint32_t fclk = DEFAULT_F_CLK);
 
-											// TFD [2..0]
-											// fast decay time setting
-											// chm=1 Fast decay time setting (MSB: tfd3):
-											// %0000 … %1111:
-											// Fast decay time setting TFD with
-											// NCLK= 32*HSTRT (%0000: slow decay only)
-#define 	TOFF(n)			(((n)&0xF)<<0)  // Off time setting controls duration of slow decay phase
-											// NCLK= 12 + 32*TOFF
-											// %0000: Driver disable, all bridges off
-											// %0001: 1 – use only with TBL ≥ 2
-											// %0010 … %1111: 2 … 15
+	uint32_t readRegister(uint8_t address, ReadStatus *status);	// addresses are from TMC5130.h. Pass an optional status pointer to detect failures.
+	uint32_t readRegister(uint8_t address) { return readRegister(address, nullptr); }
+	uint8_t  writeRegister(uint8_t address, uint32_t data, ReadStatus *status); // Pass an optional status pointer to detect failures.
+	uint8_t writeRegister(uint8_t address, uint32_t data) { return writeRegister(address, data, nullptr); }
 
-#define COOLCONF			0x6D	//coolStep smart current control register and stallGuard2 configuration
-#define 	SFILT(n)		(((n)&0x1)<<24) // 0 Standard mode, high time resolution for
-											// stallGuard2
-											// 1 Filtered mode, stallGuard2 signal updated for each
-											// four fullsteps (resp. six fullsteps for 3 phase motor)
-											// only to compensate for motor pole tolerances
-#define 	SGT(n)			(((n)&0x7F)<<16)// This signed value controls stallGuard2 level for stall
-											// output and sets the optimum measurement range for
-											// readout. A lower value gives a higher sensitivity. Zero is
-											// the starting value working with most motors.
-											// -64 to +63: A higher value makes stallGuard2 less
-											// sensitive and requires more torque to
-											// indicate a stall.
-#define 	SEIMIN(n)		(((n)&0x1)<<15) // 0: 1/2 of current setting (IRUN)
-											// 1: 1/4 of current setting (IRUN)	
-#define 	SEDN(n)			(((n)&0x3)<<13) // %00: For each 32 stallGuard2 values decrease by one
-											// %01: For each 8 stallGuard2 values decrease by one
-											// %10: For each 2 stallGuard2 values decrease by one
-											// %11: For each stallGuard2 value decrease by one
-#define 	SEMAX(n)		(((n)&0xF)<<8)  // If the stallGuard2 result is equal to or above
-											// (SEMIN+SEMAX+1)*32, the motor current becomes
-											// decreased to save energy.
-											// %0000 … %1111: 0 … 15
-#define 	SEUP(n)			(((n)&0x3)<<5)  // Current increment steps per measured stallGuard2 value %00 … %11: 1, 2, 4, 8
-#define 	SEMIN(n)		(((n)&0xF)<<0)  // If the stallGuard2 result falls below SEMIN*32, the motor
-											// current becomes increased to reduce motor load angle.
-											// %0000: smart current control coolStep off
-											// %0001 … %1111: 1 … 15
+	void resetCommunication(); // Reset communication with TMC5130 : pause activity on the serial bus.
 
-#define DRV_STATUS 			0x6F	// stallGuard2 value and driver error flags
+	void setSlaveAddress(uint8_t slaveAddress, bool NAI=true); // Set the slave address register. Take into account the TMC5130 NAI input (default to high). Range : 0 - 253 if NAI is low, 1 - 254 if NAI is high.
+	uint8_t getSlaveAddress() { return _slaveAddress; }
 
-#define SET_IHOLDDELAY(n)	(((n)&0xF)<<16)
-#define SET_IRUN(n)			(((n)&0x1F)<<8)
-#define SET_IHOLD(n)		(((n)&0x1F)<<0)
+	void setCommunicationMode(CommunicationMode mode);
+
+	/* Register read / write statistics */
+	void resetCommunicationSuccessRate();
+	float getReadSuccessRate();
+	float getWriteSuccessRate();
+protected:
+	static constexpr uint8_t NB_RETRIES_READ = 3;
+	static constexpr uint8_t NB_RETRIES_WRITE = 3;
+
+	Stream *_serial;
+	uint8_t _slaveAddress;
+	CommunicationMode _currentMode;
+	uint8_t _transmissionCounter;
+
+	/* Read / write fail statistics */
+	uint32_t _readAttemptsCounter;
+	uint32_t _readSuccessfulCounter;
+	uint32_t _writeAttemptsCounter;
+	uint32_t _writeSuccessfulCounter;
 
 
-#define WRITE_ACCESS			0x80	// Write access for spi communication
+	virtual void beginTransmission() {}
+	virtual void endTransmission() {}
 
-// Polarity for reference switch
-#define REF_SW_HIGH_ACTIV	0x00 	// non-inverted, high active: a high level on REFL stops the motor
-#define REF_SW_LOW_ACTIV	0x0C	// inverted, low active: a low level on REFL stops the motor
+	uint32_t _readReg(uint8_t address, ReadStatus *status);
+	void _writeReg(uint8_t address, uint32_t data);
 
-// Motor direction
-#define NORMAL_MOTOR_DIRECTION	0x00	// Normal motor direction
-#define INVERSE_MOTOR_DIRECTION	0x10	// Inverse motor direction
+private:
+	static constexpr uint8_t SYNC_BYTE = 0x05;
+	static constexpr uint8_t MASTER_ADDRESS = 0xFF;
 
-// Modes for RAMPMODE register
-#define POSITIONING_MODE	0x00		// using all A, D and V parameters)
-#define VELOCITY_MODE_POS	0x01		// positiv VMAX, using AMAX acceleration
-#define VELOCITY_MODE_NEG	0x02		// negativ VMAX, using AMAX acceleration
-#define HOLD_MODE			0x03		// velocity remains unchanged, unless stop event occurs
+	void computeCrc(uint8_t *datagram, uint8_t datagramLength);
+};
 
-#define VZERO				0x400		// flag in RAMP_STAT, 1: signals that the actual velocity is 0.
+
+/* UART interface with external transceiver support :
+ * the TMC5130 SWSEL input must be tied high.
+ * See TMC5130 datasheet §5.4 figure 5.2 for wiring details
+ *
+ * This interface switches a digital pin to control an external transceiver to
+ * free the bus when not transmitting.
+ *
+ * This is not optimized : the interface has to wait for the end of the
+ * transmission.
+ *
+ * Serial must be initialized externally. Serial.setTimeout() must be set to a
+ * decent value to avoid blocking for too long if there is a RX error.
+ */
+class Estee_TMC5130_UART_Transceiver : public Estee_TMC5130_UART {
+public:
+	Estee_TMC5130_UART_Transceiver(uint8_t txEnablePin = -1, // pin to enable transmission on the external transceiver
+		Stream& serial = Serial, // Serial port to use
+		uint8_t slaveAddress = 0, // TMC5130 slave address (default 0 if NAI is low, 1 if NAI is high)
+		uint32_t fclk = DEFAULT_F_CLK)
+	: Estee_TMC5130_UART(serial, slaveAddress, fclk), _txEn(txEnablePin)
+	{
+		pinMode(_txEn, OUTPUT);
+	}
+
+protected:
+	void beginTransmission()
+	{
+		digitalWrite(_txEn, HIGH);
+	}
+
+	void endTransmission()
+	{
+		_serial->flush();
+		digitalWrite(_txEn, LOW);
+	}
+
+private:
+	uint8_t _txEn;
+};
+
 
 #endif // ESTEE_TMC5130_H

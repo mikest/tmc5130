@@ -6,12 +6,13 @@ uint8_t TMC_CS = PIN_A5;  // Chip select, Active LOW. next to SCK/MOSI/MISO on t
 uint8_t TMC_EN = 10;      // Drive enable pin. Active LOW. Optional, you can also just tie to ground
 uint8_t BLE_CS = 8;       // Hidden pin #8 which controls the SS line for the Bluetooth module SPI comms
 
-Estee_TMC5130 tmc = Estee_TMC5130(TMC_CS);
+Estee_TMC5130_SPI tmc = Estee_TMC5130_SPI(TMC_CS);
 
 void setup()
 {
   // init serial coms
   Serial.begin(9600);
+
   SPI.begin();
 
   // chip select & drive enable
@@ -19,7 +20,7 @@ void setup()
   digitalWrite(TMC_EN, HIGH); // disabled for start
   pinMode(TMC_CS, OUTPUT);
   digitalWrite(TMC_EN, HIGH);
-  
+
   // disable BLE talking on SPI bus
 #if defined(ARDUINO_SAMD_ZERO)
   pinMode(BLE_CS, OUTPUT);
@@ -27,7 +28,7 @@ void setup()
 #endif
 
   // This sets the motor currents for HOLD & RUN, as well as the natural motor direction for positive moves
-  tmc.begin(0x4, 0x4, NORMAL_MOTOR_DIRECTION);
+  tmc.begin(4, 4, Estee_TMC5130::NORMAL_MOTOR_DIRECTION);
 
   // drive *MUST* be disabled when testing frequency scaling
 //  digitalWrite(TMC_EN, HIGH);
@@ -37,17 +38,10 @@ void setup()
 //  delay(5000);
 
   // ramp definition
-  uint32_t onerev = 200*256;
-  tmc.writeRegister(VSTART, 0x0);
-  tmc.writeRegister(A_1, 1000);
-  tmc.writeRegister(V_1, 50000);
-  tmc.writeRegister(AMAX, 500);
-  tmc.writeRegister(VMAX, 200000);
-  tmc.writeRegister(DMAX, 700);
-  tmc.writeRegister(D_1, 1400);
-  tmc.writeRegister(VSTOP, 10);
-  tmc.writeRegister(TZEROWAIT, 0);
-  tmc.writeRegister(RAMPMODE, 0);
+  tmc.setRampMode(Estee_TMC5130::POSITIONING_MODE);
+  tmc.setMaxSpeed(200);
+  tmc.setRampSpeeds(0, 0.1, 100); //Start, stop, threshold speeds
+  tmc.setAccelerations(250, 350, 500, 700); //AMAX, DMAX, A1, D1
 
   Serial.println("starting up");
 
@@ -63,7 +57,7 @@ bool dir = false;
 void loop()
 {
   uint32_t now = millis();
-  
+
   // every n seconds or so...
   if ( now - t_dirchange > 3000 )
   {
@@ -71,7 +65,7 @@ void loop()
 
     // reverse direction
     dir = !dir;
-    tmc.writeRegister(XTARGET, dir?(200*256):0);  // 1 full rotatation = 200s/rev * 256microsteps
+    tmc.setTargetPosition(dir ? 200 : 0);  // 1 full rotation = 200s/rev
   }
 
   // print out current position
@@ -80,9 +74,8 @@ void loop()
     t_echo = now;
 
     // get the current target position
-    int32_t xactual = 0, vactual = 0;
-    xactual = tmc.readRegister(XACTUAL);
-    vactual = tmc.readRegister(VACTUAL);
+    int32_t xactual = tmc.getCurrentPosition();
+    float vactual = tmc.getCurrentSpeed();
 
     Serial.print("xpos,v:");
     Serial.print(xactual);
